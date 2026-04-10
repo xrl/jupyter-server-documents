@@ -614,12 +614,23 @@ class YRoom(LoggingConfigurable):
         Handles SyncStep1 messages from new clients by:
 
         - Computing a SyncStep2 reply,
-        - Sending the reply to the client over WS, and
+        - Sending the reply to the client over WS,
+        - Marking the client as synced,
+        - Replaying any messages that were queued while the client was
+          desynced (fixes infra#307: silent cell loss during handshake), and
         - Sending a new SyncStep1 message immediately after.
         """
+        import sys
+
         # Mark client as desynced
         new_client = self.clients.get(client_id)
         self.clients.mark_desynced(client_id)
+
+        print(
+            f"[yroom] handle_sync_step1: client {client_id} "
+            f"(room={self.room_id})",
+            file=sys.stderr, flush=True
+        )
 
         # Compute SyncStep2 reply
         try:
@@ -634,8 +645,13 @@ class YRoom(LoggingConfigurable):
             self.log.exception(e)
             return
 
+        print(
+            f"[yroom] SYNC_STEP2 computed ({len(sync_step2_message)} bytes) "
+            f"for client {client_id}",
+            file=sys.stderr, flush=True
+        )
+
         # Write SyncStep2 reply to the client's WebSocket
-        # Marks client as synced.
         try:
             # TODO: remove the assert once websocket is made required
             assert isinstance(new_client.websocket, WebSocketHandler)
@@ -648,7 +664,40 @@ class YRoom(LoggingConfigurable):
             self.log.exception(e)
             return
 
+        # Mark synced BEFORE replaying queued messages so that any
+        # broadcasts triggered during replay go directly to the client
+        # instead of being re-queued.
         self.clients.mark_synced(client_id)
+
+        # Replay messages that were queued while the client was desynced.
+        # These are SyncUpdate/AwarenessUpdate broadcasts that fired between
+        # open() (which added the client as desynced) and now. SYNC_STEP2
+        # already covers doc state at the time it was computed, but queued
+        # messages may include updates from concurrent mutations. Yjs
+        # deduplicates any overlap.
+        pending = new_client.pending_messages
+        if pending:
+            print(
+                f"[yroom] replaying {len(pending)} queued messages "
+                f"({sum(len(m) for m in pending)} bytes) "
+                f"to newly-synced client {client_id}",
+                file=sys.stderr, flush=True
+            )
+            for msg in pending:
+                try:
+                    new_client.websocket.write_message(msg, binary=True)
+                except Exception as e:
+                    self.log.warning(
+                        f"An exception occurred when replaying a queued "
+                        f"message to client '{client_id}':"
+                    )
+                    self.log.exception(e)
+            new_client.pending_messages.clear()
+        else:
+            print(
+                f"[yroom] no queued messages to replay for client {client_id}",
+                file=sys.stderr, flush=True
+            )
 
         # Send SyncStep1 message
         try:
@@ -732,9 +781,19 @@ class YRoom(LoggingConfigurable):
 
         The YDoc is saved in the `self._on_jupyter_ydoc_update()` observer.
         """
+        import sys
         self._update_activity("_on_ydoc_update")
         update: bytes = event.update
         message = pycrdt.create_update_message(update)
+        synced_count = len(self.clients.synced)
+        desynced_count = len(self.clients.desynced)
+        if desynced_count > 0:
+            print(
+                f"[yroom] _on_ydoc_update: SyncUpdate ({len(update)} bytes), "
+                f"{synced_count} synced, {desynced_count} desynced "
+                f"(room={self.room_id})",
+                file=sys.stderr, flush=True
+            )
         self._broadcast_message(message, message_type="SyncUpdate")
 
 
@@ -854,25 +913,45 @@ class YRoom(LoggingConfigurable):
         Broadcasts a given message from a given client to all other clients.
         This method automatically logs warnings when writing to a WebSocket
         fails. `message_type` is used to produce more readable warnings.
+
+        For desynced clients (those still completing the SYNC_STEP1/SYNC_STEP2
+        handshake), messages are queued in ``client.pending_messages`` and
+        replayed after the handshake completes in ``handle_sync_step1()``.
+        This prevents the silent data loss described in infra#307.
         """
-        clients = self.clients.get_all()
-        client_count = len(clients)
-        if not client_count:
+        all_clients = self.clients.get_all(synced_only=False)
+        if not all_clients:
             return
 
-        for client in clients:
-            try:
-                # TODO: remove this assertion once websocket is made required
-                assert isinstance(client.websocket, WebSocketHandler)
-                client.websocket.write_message(message, binary=True)
-            except Exception as e:
-                self.log.warning(
-                    f"An exception occurred when broadcasting a "
-                    f"{message_type} message "
-                    f"to client '{client.id}:'"
-                )
-                self.log.exception(e)
-                continue
+        synced_count = 0
+        queued_count = 0
+        for client in all_clients:
+            if client.synced:
+                synced_count += 1
+                try:
+                    assert isinstance(client.websocket, WebSocketHandler)
+                    client.websocket.write_message(message, binary=True)
+                except Exception as e:
+                    self.log.warning(
+                        f"An exception occurred when broadcasting a "
+                        f"{message_type} message "
+                        f"to client '{client.id}:'"
+                    )
+                    self.log.exception(e)
+                    continue
+            else:
+                # Queue for replay after handshake completes
+                client.pending_messages.append(message)
+                queued_count += 1
+
+        if queued_count > 0:
+            import sys
+            print(
+                f"[yroom] broadcast {message_type}: sent to {synced_count} synced, "
+                f"queued for {queued_count} desynced clients "
+                f"(room={self.room_id})",
+                file=sys.stderr, flush=True
+            )
                 
     def _on_awareness_update(self, topic: str, changes: tuple[dict[str, Any], Any]) -> None:
         """

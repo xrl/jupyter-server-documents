@@ -28,11 +28,16 @@ class YjsClient:
 
     _synced: bool
 
+    pending_messages: list[bytes]
+    """Messages queued while the client is desynced (before the sync handshake
+    completes). These are replayed in order after the client is marked synced."""
+
     def __init__(self, websocket):
         self.websocket = websocket
         self.id = str(uuid.uuid4())
         self._synced = False
         self.last_modified = datetime.now(timezone.utc)
+        self.pending_messages = []
         
 
     @property

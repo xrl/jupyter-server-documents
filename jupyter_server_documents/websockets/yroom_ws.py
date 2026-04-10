@@ -56,6 +56,8 @@ class YRoomWebsocket(WebSocketHandler):
     
 
     def open(self, *_, **__):
+        import sys
+
         # Create the YRoom
         yroom = self.yroom_manager.get_room(self.room_id)
         if not yroom:
@@ -69,6 +71,15 @@ class YRoomWebsocket(WebSocketHandler):
         if not self.client_id:
             self.close(code=1001)
             return
+
+        synced_count = len(self.yroom.clients.synced)
+        desynced_count = len(self.yroom.clients.desynced)
+        print(
+            f"[yroom_ws] client {self.client_id} added to desynced "
+            f"for room {self.room_id} "
+            f"(synced={synced_count}, desynced={desynced_count})",
+            file=sys.stderr, flush=True
+        )
 
 
     def on_message(self, message: bytes):

@@ -1,11 +1,23 @@
 from __future__ import annotations
 import asyncio
 import pytest
-from unittest.mock import Mock
+import pycrdt
+from unittest.mock import Mock, MagicMock
+from tornado.websocket import WebSocketHandler
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ...conftest import MakeYRoom, MakeYRoomManager, MakeRoomFile
+
+
+def make_mock_websocket() -> MagicMock:
+    """Create a MagicMock that passes isinstance(x, WebSocketHandler) checks
+    and records all messages written to it."""
+    ws = MagicMock(spec=WebSocketHandler)
+    ws._messages = []
+    ws.write_message.side_effect = lambda msg, binary=False: ws._messages.append(msg)
+    ws.ws_connection = True
+    return ws
 
 
 class TestYRoomCallbacks():
@@ -190,3 +202,252 @@ class TestYRoomAutoRestart():
         room.set_cell_awareness_state("cell-1", "busy")
         assert not room.stopped
         assert manager.has_room(room_id)
+
+
+class TestSyncHandshakeRace:
+    """
+    Regression tests for infra#307: when a new client connects and the doc is
+    mutated during the SYNC_STEP1/SYNC_STEP2 handshake, the new client must
+    eventually receive all mutations. Before the fix, broadcasts during the
+    handshake gap were silently dropped for desynced clients.
+    """
+
+    @pytest.mark.asyncio
+    async def test_broadcast_queues_for_desynced_client(self, make_yroom: MakeYRoom):
+        """
+        Asserts that _broadcast_message queues messages for desynced clients
+        instead of dropping them.
+        """
+        room = await make_yroom()
+
+        # Add a synced client (client A) and a desynced client (client B)
+        ws_a = make_mock_websocket()
+        ws_b = make_mock_websocket()
+        client_a_id = room.clients.add(ws_a)
+        client_b_id = room.clients.add(ws_b)
+        room.clients.mark_synced(client_a_id)
+        # B stays desynced
+
+        client_b = room.clients.get(client_b_id)
+        assert not client_b.synced
+        assert len(client_b.pending_messages) == 0
+
+        # Mutate the ydoc — this triggers _on_ydoc_update → _broadcast_message
+        with room._ydoc.transaction():
+            room._ydoc["test_map"] = pycrdt.Map()
+            room._ydoc["test_map"]["key"] = "value"
+
+        # Client A (synced) should have received the broadcast
+        assert len(ws_a._messages) > 0
+
+        # Client B (desynced) should have the message queued, not delivered
+        assert len(ws_b._messages) == 0
+        assert len(client_b.pending_messages) > 0
+
+    @pytest.mark.asyncio
+    async def test_handshake_replays_queued_messages(self, make_yroom: MakeYRoom):
+        """
+        Asserts that handle_sync_step1 replays queued messages to the client
+        after marking it synced. This is the core fix for infra#307.
+        """
+        room = await make_yroom()
+
+        # Add client B as desynced
+        ws_b = make_mock_websocket()
+        client_b_id = room.clients.add(ws_b)
+
+        # Mutate the ydoc multiple times while B is desynced
+        for i in range(5):
+            with room._ydoc.transaction():
+                room._ydoc[f"map_{i}"] = pycrdt.Map()
+                room._ydoc[f"map_{i}"]["data"] = f"value_{i}"
+
+        client_b = room.clients.get(client_b_id)
+        queued_count = len(client_b.pending_messages)
+        assert queued_count > 0, "Should have queued messages while desynced"
+
+        # No messages delivered to the WebSocket yet
+        assert len(ws_b._messages) == 0
+
+        # Now simulate B sending SYNC_STEP1 (empty state vector — new client)
+        client_doc = pycrdt.Doc()
+        sync_step1 = pycrdt.create_sync_message(client_doc)
+
+        # Process the SYNC_STEP1 via handle_message (the same path the
+        # message queue processor uses)
+        room.handle_message(client_b_id, sync_step1)
+
+        # B should now be synced
+        assert client_b.synced
+
+        # B should have received: SYNC_STEP2 + queued replays + SYNC_STEP1
+        # At minimum: 1 SYNC_STEP2 + queued_count replays + 1 SYNC_STEP1
+        assert len(ws_b._messages) >= queued_count + 2
+
+        # The queued messages should have been cleared
+        assert len(client_b.pending_messages) == 0
+
+        # Verify the client doc has all the data after applying all messages
+        for msg in ws_b._messages:
+            if len(msg) < 2:
+                continue
+            msg_type = msg[0]
+            if msg_type == pycrdt.YMessageType.SYNC:
+                try:
+                    pycrdt.handle_sync_message(msg[1:], client_doc)
+                except Exception:
+                    pass  # Some messages may not be applicable
+
+        # Client should have all 5 maps
+        for i in range(5):
+            assert f"map_{i}" in client_doc, f"Client doc missing map_{i}"
+
+    @pytest.mark.asyncio
+    async def test_no_data_loss_during_rapid_mutations(self, make_yroom: MakeYRoom):
+        """
+        Regression test: simulates the exact infra#307 scenario where an AI
+        agent rapidly adds cells while a second browser tab connects.
+        All mutations must be received by the new client.
+        """
+        room = await make_yroom()
+
+        # Client A is already synced (first browser tab)
+        ws_a = make_mock_websocket()
+        client_a_id = room.clients.add(ws_a)
+        room.clients.mark_synced(client_a_id)
+
+        # Add some initial content (simulates cells already created)
+        with room._ydoc.transaction():
+            room._ydoc["cells"] = pycrdt.Array()
+            for i in range(10):
+                room._ydoc["cells"].append(f"initial_cell_{i}")
+
+        ws_a._messages.clear()  # reset for clarity
+
+        # Client B connects (second browser tab) — starts as desynced
+        ws_b = make_mock_websocket()
+        client_b_id = room.clients.add(ws_b)
+
+        # While B is desynced, AI agent rapidly adds 19 more cells
+        for i in range(19):
+            with room._ydoc.transaction():
+                room._ydoc["cells"].append(f"ai_cell_{i}")
+
+        # B sends SYNC_STEP1 with empty state
+        client_b_doc = pycrdt.Doc()
+        client_b_doc["cells"] = pycrdt.Array()  # declare shared type before sync
+        sync_step1 = pycrdt.create_sync_message(client_b_doc)
+        room.handle_message(client_b_id, sync_step1)
+
+        # Apply all messages to B's doc
+        for msg in ws_b._messages:
+            if len(msg) < 2:
+                continue
+            if msg[0] == pycrdt.YMessageType.SYNC:
+                try:
+                    pycrdt.handle_sync_message(msg[1:], client_b_doc)
+                except Exception:
+                    pass
+
+        # B must have ALL 29 cells (10 initial + 19 AI-added)
+        b_cells = list(client_b_doc["cells"])
+        assert len(b_cells) == 29, (
+            f"Client B has {len(b_cells)} cells, expected 29. "
+            f"Missing cells indicate data loss during sync handshake."
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_exception_during_handshake_with_mutations(self, make_yroom: MakeYRoom):
+        """
+        Regression test for infra#300: concurrent mutations during sync
+        handshake must not cause crashes (e.g., findIndexSS 'Unexpected case').
+        """
+        room = await make_yroom()
+
+        # Synced client A
+        ws_a = make_mock_websocket()
+        client_a_id = room.clients.add(ws_a)
+        room.clients.mark_synced(client_a_id)
+
+        # Add initial doc state
+        with room._ydoc.transaction():
+            room._ydoc["data"] = pycrdt.Map()
+            room._ydoc["data"]["counter"] = 0
+
+        # Connect multiple desynced clients, mutate doc, then sync them all
+        desynced_clients = []
+        for _ in range(5):
+            ws = make_mock_websocket()
+            cid = room.clients.add(ws)
+            desynced_clients.append((ws, cid))
+
+        # Rapid mutations while all 5 clients are desynced
+        for i in range(50):
+            with room._ydoc.transaction():
+                room._ydoc["data"]["counter"] = i
+
+        # Sync all clients — no exceptions should be raised
+        for ws, cid in desynced_clients:
+            client_doc = pycrdt.Doc()
+            client_doc["data"] = pycrdt.Map()  # declare shared type before sync
+            sync_step1 = pycrdt.create_sync_message(client_doc)
+            room.handle_message(cid, sync_step1)
+
+            # Apply messages to client doc — no exceptions
+            for msg in ws._messages:
+                if len(msg) < 2:
+                    continue
+                if msg[0] == pycrdt.YMessageType.SYNC:
+                    pycrdt.handle_sync_message(msg[1:], client_doc)
+
+            # All clients must see the final counter value
+            assert client_doc["data"]["counter"] == 49
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("num_mutations", [10, 50, 100])
+    @pytest.mark.parametrize("num_clients", [2, 5])
+    async def test_concurrent_mutations_stress(
+        self, make_yroom: MakeYRoom, num_mutations: int, num_clients: int
+    ):
+        """
+        Stress test: N clients connect while the doc is being mutated.
+        All clients must converge to the same final state.
+        """
+        room = await make_yroom()
+
+        # Pre-populate with a cells array
+        with room._ydoc.transaction():
+            room._ydoc["cells"] = pycrdt.Array()
+
+        # Connect N desynced clients
+        clients = []
+        for _ in range(num_clients):
+            ws = make_mock_websocket()
+            cid = room.clients.add(ws)
+            clients.append((ws, cid))
+
+        # Apply num_mutations while all clients are desynced
+        for i in range(num_mutations):
+            with room._ydoc.transaction():
+                room._ydoc["cells"].append(f"cell_{i}")
+
+        # Sync all clients
+        for ws, cid in clients:
+            client_doc = pycrdt.Doc()
+            client_doc["cells"] = pycrdt.Array()  # declare shared type before sync
+            sync_step1 = pycrdt.create_sync_message(client_doc)
+            room.handle_message(cid, sync_step1)
+
+            for msg in ws._messages:
+                if len(msg) < 2:
+                    continue
+                if msg[0] == pycrdt.YMessageType.SYNC:
+                    try:
+                        pycrdt.handle_sync_message(msg[1:], client_doc)
+                    except Exception:
+                        pass
+
+            cells = list(client_doc["cells"])
+            assert len(cells) == num_mutations, (
+                f"Client has {len(cells)} cells, expected {num_mutations}"
+            )
