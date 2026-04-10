@@ -206,10 +206,66 @@ class TestYRoomAutoRestart():
 
 class TestSyncHandshakeRace:
     """
-    Regression tests for infra#307: when a new client connects and the doc is
-    mutated during the SYNC_STEP1/SYNC_STEP2 handshake, the new client must
-    eventually receive all mutations. Before the fix, broadcasts during the
-    handshake gap were silently dropped for desynced clients.
+    Regression tests for infra#307 and jupyter-server-documents#197.
+
+    THE BUG
+    =======
+    When a new browser tab (Client B) opens a notebook while an AI agent is
+    rapidly adding cells via MCP tool calls, Client B silently misses cells
+    and never catches up. No errors — just data loss.
+
+    Two independent bugs interact:
+
+      Bug 1 (handshake race): _broadcast_message() only sends to synced
+      clients. Between open() (adds B as desynced) and mark_synced() in
+      handle_sync_step1(), all broadcasts are dropped for B.
+
+      Bug 2 (pycrdt offset encoding): pycrdt encodes Text CRDT positions as
+      UTF-8 byte offsets, but JS yjs expects UTF-16. Incremental updates
+      after multi-byte characters crash JS yjs with findIndexSS.
+
+    THE FIX (Approach C: queue + batched catchup)
+    =============================================
+    _broadcast_message() now queues messages for desynced clients.
+    handle_sync_step1() sends ONE batched diff from the pre-sync state vector
+    instead of replaying individual queued messages. This fixes Bug 1 (delivery)
+    and works around Bug 2 (batching avoids the offset encoding crash).
+
+    WHAT THE TESTS VERIFY
+    =====================
+    Each test simulates the server-side sync flow with mock WebSockets.
+    The sequence for the main scenario (test_no_data_loss_during_rapid_mutations):
+
+        Server                          Client A (synced)    Client B (new tab)
+        ──────                          ─────────────────    ──────────────────
+        doc has 10 cells
+                                                             WebSocket connect
+        clients.add(B) → desynced
+                                                             (B is desynced)
+        AI adds cell 11
+        _broadcast_message()
+          → send to A (synced)          ← receives cell 11
+          → queue for B (desynced)                           (queued, not sent)
+        AI adds cell 12
+          → send to A                   ← receives cell 12
+          → queue for B                                      (queued)
+        ...
+        AI adds cell 29
+          → send to A                   ← receives cell 29
+          → queue for B                                      (queued)
+
+                                                             B sends SYNC_STEP1
+        handle_sync_step1(B):
+          save pre_sync_sv
+          compute SYNC_STEP2 (29 cells)
+          send SYNC_STEP2 to B                               ← receives 29 cells
+          mark_synced(B)
+          compute catchup = get_update(pre_sync_sv)
+          send batched catchup to B                          ← receives gap diff
+          clear B.pending_messages
+          send SYNC_STEP1 to B                               ← (for B→server sync)
+
+        Result: B has all 29 cells. No data loss. ✓
     """
 
     @pytest.mark.asyncio
