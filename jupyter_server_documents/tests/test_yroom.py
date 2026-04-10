@@ -245,10 +245,12 @@ class TestSyncHandshakeRace:
         assert len(client_b.pending_messages) > 0
 
     @pytest.mark.asyncio
-    async def test_handshake_replays_queued_messages(self, make_yroom: MakeYRoom):
+    async def test_handshake_sends_batched_catchup(self, make_yroom: MakeYRoom):
         """
-        Asserts that handle_sync_step1 replays queued messages to the client
-        after marking it synced. This is the core fix for infra#307.
+        Asserts that handle_sync_step1 sends a batched catchup update
+        (not individual replayed messages) after marking a client synced.
+        This is the core fix for infra#307, using Approach C to also avoid
+        the pycrdt offset encoding bug (jupyter-server-documents#197).
         """
         room = await make_yroom()
 
@@ -280,11 +282,11 @@ class TestSyncHandshakeRace:
         # B should now be synced
         assert client_b.synced
 
-        # B should have received: SYNC_STEP2 + queued replays + SYNC_STEP1
-        # At minimum: 1 SYNC_STEP2 + queued_count replays + 1 SYNC_STEP1
-        assert len(ws_b._messages) >= queued_count + 2
+        # B should have received: SYNC_STEP2 + batched catchup + SYNC_STEP1
+        # (3 messages, not queued_count + 2 individual replays)
+        assert len(ws_b._messages) >= 2  # at least SYNC_STEP2 + SYNC_STEP1
 
-        # The queued messages should have been cleared
+        # The queued messages should have been cleared (not replayed)
         assert len(client_b.pending_messages) == 0
 
         # Verify the client doc has all the data after applying all messages

@@ -613,12 +613,18 @@ class YRoom(LoggingConfigurable):
         """
         Handles SyncStep1 messages from new clients by:
 
+        - Saving the server's state vector (for catchup after sync),
         - Computing a SyncStep2 reply,
         - Sending the reply to the client over WS,
         - Marking the client as synced,
-        - Replaying any messages that were queued while the client was
-          desynced (fixes infra#307: silent cell loss during handshake), and
+        - Sending a batched catchup update covering any mutations that
+          occurred during the handshake gap (fixes infra#307), and
         - Sending a new SyncStep1 message immediately after.
+
+        The catchup is sent as a single batched diff rather than replaying
+        individual queued messages. This avoids triggering a pycrdt offset
+        encoding bug (jupyter-server-documents#197) where incremental
+        updates after multi-byte characters crash JS yjs clients.
         """
         import sys
 
@@ -631,6 +637,11 @@ class YRoom(LoggingConfigurable):
             f"(room={self.room_id})",
             file=sys.stderr, flush=True
         )
+
+        # Save server state BEFORE computing SYNC_STEP2. Any mutations that
+        # occur between now and mark_synced() will be captured by computing
+        # get_update(pre_sync_sv) after syncing.
+        pre_sync_sv = self._ydoc.get_state()
 
         # Compute SyncStep2 reply
         try:
@@ -664,40 +675,47 @@ class YRoom(LoggingConfigurable):
             self.log.exception(e)
             return
 
-        # Mark synced BEFORE replaying queued messages so that any
-        # broadcasts triggered during replay go directly to the client
-        # instead of being re-queued.
+        # Mark synced so that future broadcasts go directly to this client.
         self.clients.mark_synced(client_id)
 
-        # Replay messages that were queued while the client was desynced.
-        # These are SyncUpdate/AwarenessUpdate broadcasts that fired between
-        # open() (which added the client as desynced) and now. SYNC_STEP2
-        # already covers doc state at the time it was computed, but queued
-        # messages may include updates from concurrent mutations. Yjs
-        # deduplicates any overlap.
-        pending = new_client.pending_messages
-        if pending:
-            print(
-                f"[yroom] replaying {len(pending)} queued messages "
-                f"({sum(len(m) for m in pending)} bytes) "
-                f"to newly-synced client {client_id}",
-                file=sys.stderr, flush=True
+        # Send a batched catchup update covering any mutations that occurred
+        # during the handshake gap (between open() and now). This is sent as
+        # ONE update computed from the pre-sync state vector, rather than
+        # replaying individual queued messages. A single batched update keeps
+        # all CRDT struct references resolvable within the same message,
+        # avoiding the findIndexSS crash in JS yjs clients caused by pycrdt's
+        # offset encoding bug with multi-byte characters.
+        #
+        # Discard any individually queued messages — the batched diff covers
+        # the same content.
+        queued_count = len(new_client.pending_messages)
+        new_client.pending_messages.clear()
+
+        try:
+            catchup_update = self._ydoc.get_update(pre_sync_sv)
+            # An empty update is b"\x00\x00" (2 bytes)
+            if catchup_update and len(catchup_update) > 2:
+                catchup_message = pycrdt.create_update_message(catchup_update)
+                new_client.websocket.write_message(catchup_message, binary=True)
+                print(
+                    f"[yroom] sent batched catchup ({len(catchup_update)} bytes) "
+                    f"to client {client_id} "
+                    f"(replaced {queued_count} queued messages)",
+                    file=sys.stderr, flush=True
+                )
+            else:
+                print(
+                    f"[yroom] no catchup needed for client {client_id} "
+                    f"({queued_count} queued messages discarded, "
+                    f"already covered by SYNC_STEP2)",
+                    file=sys.stderr, flush=True
+                )
+        except Exception as e:
+            self.log.warning(
+                f"An exception occurred when sending catchup update "
+                f"to client '{client_id}':"
             )
-            for msg in pending:
-                try:
-                    new_client.websocket.write_message(msg, binary=True)
-                except Exception as e:
-                    self.log.warning(
-                        f"An exception occurred when replaying a queued "
-                        f"message to client '{client_id}':"
-                    )
-                    self.log.exception(e)
-            new_client.pending_messages.clear()
-        else:
-            print(
-                f"[yroom] no queued messages to replay for client {client_id}",
-                file=sys.stderr, flush=True
-            )
+            self.log.exception(e)
 
         # Send SyncStep1 message
         try:
